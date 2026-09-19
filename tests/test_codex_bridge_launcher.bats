@@ -55,20 +55,39 @@ setup() {
   # it at bash makes bash the interpreter for this file regardless of its .js
   # name, so the launcher's default (no-custom-wrapper) path runs unmodified.
   # Mock bridge: records argv AND publishes the same per-PID identity lease the
-  # real bridge does (so the reaper, which reads leases, can find/spare it). All
+  # real bridge does (so the reaper, which reads leases, can find/spare it), and,
+  # when the launcher started it, the role pidfile the way writeMeta() does. All
   # of $CAPTURE / $SCRIPTS / $RUN_DIR come from the environment it inherits.
   cat > "$SCRIPTS/drivers/types/codex/codex-bridge.js" <<'EOF'
 #!/usr/bin/env bash
 printf '%s\n' "$*" >> "$CAPTURE"
 source "$SCRIPTS/lib/hash.sh" 2>/dev/null || true
-_proj=""; _parr=()
+_proj=""; _parr=(); _launched=""
 while [ "$#" -gt 0 ]; do
   case "$1" in
     --project) _proj="$2"; shift 2 ;;
     --pair) _parr+=("$2"); shift 2 ;;
+    --inline-inbox) _launched=1; shift ;;
     *) shift ;;
   esac
 done
+# The role pidfile, as writeMeta() publishes it: the pid the file's READERS
+# resolve, which under Git Bash is this process's Windows pid (the real bridge's
+# process.pid), elsewhere $$. Only when the launcher started this mock -- it
+# always passes --inline-inbox, _spawn_fake never does -- because an orphan
+# fixture claiming the role's pidfile would void the premise of the #937 tests.
+# What the file held BEFORE is kept beside $CAPTURE: that is what the launcher
+# itself published at spawn, and the windows-native test reads it there.
+if [ -n "$_launched" ] && [ "${#_parr[@]}" -eq 1 ]; then
+  _selfpid="$$"
+  case "${MSYSTEM:-}" in
+    MINGW*|MSYS*|CLANGARM*) IFS= read -r _selfpid 2>/dev/null < "/proc/$$/winpid" || _selfpid="$$" ;;
+  esac
+  _tab="$(printf '\t')"
+  _pidfile="$RUN_DIR/codex-bridge.${_parr[0]//$_tab/.}.pid"
+  { cat "$_pidfile" 2>/dev/null || true; } > "$CAPTURE.pidfile-at-start"
+  printf '%s\n' "$_selfpid" > "$_pidfile"
+fi
 _lease="$RUN_DIR/codex-bridge-lease.$$"
 # Start token exactly as codex-bridge-launcher.sh _start_token computes it: /proc
 # field 22 where available, else a trimmed `ps -o lstart=`.
@@ -282,7 +301,13 @@ run_launcher() {
   done
   [ -n "$recorded" ]
   [ "$recorded" != 99999999 ]
-  kill -0 "$recorded"
+  # Alive by the probe the pidfile's READERS use, not by kill -0. Under Git Bash
+  # the pidfile holds the bridge's Windows pid -- the one tasklist, Get-Process
+  # and the bridge's process.kill resolve -- and kill(1) in the MSYS pid space
+  # cannot see that number at all (measured: "No such process" for a live
+  # child). On every other host _agmsg_pid_alive is the kill -0 this line was.
+  source "$SCRIPTS/lib/instance-id.sh"
+  _agmsg_pid_alive "$recorded"
 
   wait "$driver_pid" 2>/dev/null || true
 }
@@ -572,6 +597,71 @@ wait_for_child_count() {
 
   [ -f "$CAPTURE" ] || { echo "no bridge was started on native Windows"; false; }
   grep -q -- '--thread thread-win' "$CAPTURE"
+}
+
+@test "launcher: windows-native leaves the pidfile to the bridge instead of recording its MSYS pid" {
+  skip_unless_windows "the point is the real MSYS pid space and the real tasklist"
+  # The pid the launcher records at spawn is read by _agmsg_pid_alive (tasklist),
+  # _start_token (Get-Process) and the bridge's own ensureSingleInstance
+  # (process.kill), all of which resolve WINDOWS pids -- the number
+  # codex-bridge.js records as process.pid. $! is an MSYS pid, which tasklist has
+  # no record of, so recording it left a live bridge reading as dead on the next
+  # tick, or, when an unrelated Windows process held that number, made the
+  # bridge die at startup with "bridge already running". And it cannot be
+  # translated at spawn: /proc/<msys-pid>/winpid read there is the forked shell's
+  # or nohup's Windows pid, not the bridge's (this test caught exactly that when
+  # the launcher tried -- 43884 recorded, 31632 the bridge's). So under Git Bash
+  # the launcher records nothing and the bridge's own publication stands. Real
+  # MSYS pid space, real tasklist, no stub. Mutate the launcher back to
+  # recording $! -- or its winpid -- and this fails where it counts, on Windows,
+  # with nothing simulated.
+  put_record team alice thread-win "$PROJ" codex
+  # Long enough for the mock to still be running once the dispatcher has been
+  # retired below: /proc/<pid>/winpid and tasklist can only answer for a live one.
+  export MOCK_BRIDGE_SLEEP=10
+
+  run_launcher_until_capture || true
+  [ -f "$CAPTURE" ] || { echo "no bridge was started on native Windows"; false; }
+
+  # The mock's MSYS pid is the suffix of the lease it publishes (its $$). That is
+  # also the number the launcher saw as $! -- exec keeps the MSYS pid -- so it is
+  # exactly the value a regression would have written. The mock writes the lease
+  # after the pidfile, so once the lease exists the pidfile is settled too.
+  local lease="" f i
+  for i in {1..50}; do
+    for f in "$RUN_DIR"/codex-bridge-lease.*; do
+      [ -e "$f" ] && { lease="$f"; break; }
+    done
+    [ -n "$lease" ] && break
+    sleep 0.1
+  done
+  [ -n "$lease" ] || { echo "the mock bridge published no lease"; false; }
+  local msys_pid="${lease##*codex-bridge-lease.}"
+  case "$msys_pid" in ''|*[!0-9]*) echo "lease suffix is not a pid: $lease"; false ;; esac
+  local win_pid; win_pid="$(cat "/proc/$msys_pid/winpid")"
+  [ -n "$win_pid" ] || { echo "no winpid for MSYS pid $msys_pid; is the mock still alive?"; false; }
+  # Positive control: the two spaces must actually differ here, or an equality
+  # below distinguishes nothing.
+  [ "$win_pid" != "$msys_pid" ] || { echo "MSYS pid and Windows pid coincide ($msys_pid); nothing to tell apart"; false; }
+
+  # What the launcher had published by the time the bridge started: nothing. The
+  # mock copies the pidfile's content aside before publishing its own pid.
+  local at_start; at_start="$(cat "$CAPTURE.pidfile-at-start")"
+  [ -z "$at_start" ] || { echo "the launcher recorded '$at_start' at spawn (bridge: MSYS $msys_pid, Windows $win_pid)"; false; }
+
+  # What stands afterwards is the bridge's own Windows pid, and the readers'
+  # probe resolves it -- the property the launcher's reuse check depends on next
+  # tick.
+  local recorded; recorded="$(cat "$RUN_DIR/codex-bridge.team.alice.pid")"
+  [ "$recorded" = "$win_pid" ] || { echo "pidfile holds $recorded; the bridge's Windows pid is $win_pid (MSYS $msys_pid)"; false; }
+  source "$SCRIPTS/lib/instance-id.sh"
+  _agmsg_pid_alive "$recorded"
+
+  # teardown's pidfile sweep signals what it reads with kill(1), which cannot
+  # reach a Windows pid from the MSYS side; stop the mock by the MSYS pid its
+  # lease named so it does not outlive this test.
+  kill "$msys_pid" 2>/dev/null || true
+  wait_for_pid_exit "$msys_pid" || true
 }
 
 # --- #937: reap a same-(project,role) orphan via its per-PID identity lease ---

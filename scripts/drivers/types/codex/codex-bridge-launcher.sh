@@ -924,16 +924,47 @@ EOF
     --inline-inbox \
     >>"$log" 2>&1 3>&- 4>&- &
   launched_pid=$!
-  # On Windows Git Bash, $! is an MSYS PID, while codex-bridge.js uses the
-  # Windows native PID from Node's process.pid. Do not publish the MSYS PID
-  # as the bridge PID; let codex-bridge.js publish its native PID.
+  # Record the spawned pid at once, so the window until the bridge's own
+  # writeMeta() has neither a stale predecessor for status to point at nor an
+  # empty pidfile for the next tick to read as "no bridge" and spawn beside it.
+  #
+  # Not under Git Bash. $! there is an MSYS pid, and every reader of this file
+  # -- _agmsg_pid_alive (tasklist), _start_token (Get-Process), the bridge's
+  # own ensureSingleInstance (process.kill) -- resolves the Windows pid that
+  # codex-bridge.js records as process.pid. tasklist has no record of the MSYS
+  # number (measured: 0 rows for a live bridge), so publishing it read as
+  # "dead", or, when an unrelated Windows process held that number, made
+  # ensureSingleInstance() die with "bridge already running". Nor can it be
+  # translated here: /proc/<msys-pid>/winpid names whichever Windows process
+  # carries that MSYS pid right now, and right after `&` that is the forked
+  # copy of this shell, then nohup, and only then the bridge -- read at this
+  # point it returned a Windows pid the bridge never had (measured 2026-09-19:
+  # 43884 recorded, 31632 the bridge's). The same MSYSTEM test as
+  # _agmsg_pid_alive, so the writer and the readers decide the pid space the
+  # same way. There, publish nothing and let writeMeta() publish process.pid;
+  # the wait below is what closes the next-tick window instead.
+  record_pid=""
   case "${MSYSTEM:-}" in
-    MINGW*|MSYS*|CLANGARM*)
-      ;;
+    MINGW*|MSYS*|CLANGARM*) ;;
     *)
-      printf '%s\n' "$launched_pid" > "$pidfile"
+      record_pid="$launched_pid"
+      printf '%s\n' "$record_pid" > "$pidfile"
       ;;
   esac
+  if [ -z "$record_pid" ] && [ -z "${AGMSG_CODEX_BRIDGE_CMD:-}" ]; then
+    # Nothing recorded, so until writeMeta() lands the next tick would read
+    # "no bridge" and start a second one beside a bridge still booting. Wait
+    # for that write -- or for the child to die -- bounded at 10s: a bridge
+    # that cannot start is left to the rate cap and the dead-pid path, as
+    # before. -s, not -f: writeFileSync creates the file before it fills it.
+    # The custom-bridge path below waits on its process in the foreground and
+    # is not part of this.
+    _wait_i=0
+    while [ ! -s "$pidfile" ] && [ "$_wait_i" -lt 50 ] && _agmsg_pid_alive_local "$launched_pid"; do
+      sleep 0.2
+      _wait_i=$((_wait_i + 1))
+    done
+  fi
   if [ -n "${AGMSG_CODEX_BRIDGE_CMD:-}" ]; then
     # A custom bridge is foregrounded by the test harness, so a plain wait
     # would hide a role change until the bridge exits on its own. Poll the
@@ -961,9 +992,11 @@ EOF
       sleep 0.2
     done
     wait "$launched_pid" 2>/dev/null || true
+    # Clear the pidfile only if it still holds the pid THIS launcher recorded
+    # (if it recorded one at all, see above); one the bridge wrote is its.
     recorded_pid=""
     IFS= read -r recorded_pid < "$pidfile" 2>/dev/null || true
-    [ "$recorded_pid" != "$launched_pid" ] || rm -f "$pidfile"
+    [ "$recorded_pid" != "$record_pid" ] || rm -f "$pidfile"
   fi
   # Record what this bridge is bound to so a later launcher can detect staleness.
   printf '%s' "$req_app_server" > "$appserver_file"
