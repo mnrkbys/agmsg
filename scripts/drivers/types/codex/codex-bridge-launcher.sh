@@ -924,7 +924,16 @@ EOF
     --inline-inbox \
     >>"$log" 2>&1 3>&- 4>&- &
   launched_pid=$!
-  printf '%s\n' "$launched_pid" > "$pidfile"
+  # On Windows Git Bash, $! is an MSYS PID, while codex-bridge.js uses the
+  # Windows native PID from Node's process.pid. Do not publish the MSYS PID
+  # as the bridge PID; let codex-bridge.js publish its native PID.
+  case "${MSYSTEM:-}" in
+    MINGW*|MSYS*|CLANGARM*)
+      ;;
+    *)
+      printf '%s\n' "$launched_pid" > "$pidfile"
+      ;;
+  esac
   if [ -n "${AGMSG_CODEX_BRIDGE_CMD:-}" ]; then
     # A custom bridge is foregrounded by the test harness, so a plain wait
     # would hide a role change until the bridge exits on its own. Poll the
